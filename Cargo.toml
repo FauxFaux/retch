@@ -1,0 +1,16 @@
+[package]
+name = "retch"
+version = "0.1.0"
+authors = ["Chris West (Faux) <git@goeswhere.com>"]
+edition = "2018"
+
+[dependencies]
+ct-logs = "0.5"
+failure = "0.1"
+mio = "0.6"
+rustls = "0.15"
+httparse = "1"
+url = "1.7"
+vecio = "0.1"
+webpki = "0.19"
+webpki-roots = "0.16"
