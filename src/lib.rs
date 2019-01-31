@@ -1,112 +1,30 @@
+use std::fs;
 use std::io;
 use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 
+use failure::bail;
 use failure::err_msg;
 use failure::Error;
-use mio::tcp::TcpStream;
-use rustls::Session;
+use iowrap::ReadMany;
 use url::Url;
-use vecio::Rawv;
 
-const CLIENT: mio::Token = mio::Token(0);
+mod oneshot_tls;
 
-pub fn get<S: AsRef<str>>(url: S) -> Result<(), Error> {
-    unimplemented!()
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct StatusCode(u16);
+
+pub struct Response {
+    response_code: u16,
+    inner: io::BufReader<fs::File>,
+    header_end: u64,
 }
 
-struct TlsClient {
-    socket: TcpStream,
-    tls_session: rustls::ClientSession,
-}
-
-impl TlsClient {
-    fn new(
-        sock: TcpStream,
-        hostname: webpki::DNSNameRef<'_>,
-        cfg: Arc<rustls::ClientConfig>,
-    ) -> TlsClient {
-        TlsClient {
-            socket: sock,
-            tls_session: rustls::ClientSession::new(&cfg, hostname),
-        }
-    }
-
-    fn do_read(&mut self) -> Result<bool, Error> {
-        // Read TLS data. This fails if the underlying TCP connection is broken.
-
-        if 0 == self.tls_session.read_tls(&mut self.socket)? {
-            // "clean eof".. not sure why we would get here without a close-notify
-            return Ok(true);
-        }
-
-        // Reading some TLS data might have yielded new TLS messages to process.
-        // Errors from this indicate TLS protocol problems and are fatal.
-        self.tls_session.process_new_packets()?;
-
-        Ok(false)
-    }
-
-    fn do_write(&mut self) {
-        self.tls_session
-            .writev_tls(&mut WriteVAdapter::new(&mut self.socket))
-            .unwrap();
-    }
-
-    fn register(&self, poll: &mut mio::Poll) {
-        poll.register(
-            &self.socket,
-            CLIENT,
-            self.ready_interest(),
-            mio::PollOpt::level() | mio::PollOpt::oneshot(),
-        )
-        .unwrap();
-    }
-
-    fn reregister(&self, poll: &mut mio::Poll) {
-        poll.reregister(
-            &self.socket,
-            CLIENT,
-            self.ready_interest(),
-            mio::PollOpt::level() | mio::PollOpt::oneshot(),
-        )
-        .unwrap();
-    }
-
-    // Use wants_read/wants_write to register for different mio-level IO readiness events.
-    fn ready_interest(&self) -> mio::Ready {
-        let rd = self.tls_session.wants_read();
-        let wr = self.tls_session.wants_write();
-
-        if rd && wr {
-            mio::Ready::readable() | mio::Ready::writable()
-        } else if wr {
-            mio::Ready::writable()
-        } else {
-            mio::Ready::readable()
-        }
-    }
-}
-
-impl io::Write for TlsClient {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.tls_session.write(bytes)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.tls_session.flush()
-    }
-}
-
-impl io::Read for TlsClient {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.tls_session.read(bytes)
-    }
-}
-
-pub fn single(url: &Url) -> Result<(), Error> {
+pub fn get(url: &Url) -> Result<Response, Error> {
     let host = url.host_str().ok_or_else(|| err_msg("relative url"))?;
 
     let port = url
@@ -118,80 +36,72 @@ pub fn single(url: &Url) -> Result<(), Error> {
         .next()
         .ok_or_else(|| err_msg("resolution empty"))?;
 
-    let sock = TcpStream::connect(&addr)?;
-
-    let mut config = rustls::ClientConfig::new();
-    config
-        .root_store
-        .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
-    config.ct_logs = Some(&ct_logs::LOGS);
-
-    let config = Arc::new(config);
-    let dns_name =
-        webpki::DNSNameRef::try_from_ascii_str(host).map_err(|()| err_msg("invalid sni name"))?;
-    let mut tlsclient = TlsClient::new(sock, dns_name, config);
-
     let httpreq = format!(
-        "GET / HTTP/1.1\r\nHost: {}\r\nConnection: \
+        "GET {}{} HTTP/1.1\r\nHost: {}\r\nConnection: \
          close\r\nAccept-Encoding: identity\r\n\r\n",
+        url.path(),
+        url.query()
+            .map(|q| format!("?{}", q))
+            .unwrap_or(String::new()),
         host
     );
-    tlsclient.write_all(httpreq.as_bytes()).unwrap();
 
-    let mut poll = mio::Poll::new()?;
-    let mut events = mio::Events::with_capacity(8);
-    tlsclient.register(&mut poll);
+    let mut out = oneshot_tls::oneshot(addr, host, httpreq)?;
 
-    'polling: loop {
-        poll.poll(&mut events, None)?;
+    out.seek(SeekFrom::Start(0))?;
 
-        for ev in events.iter() {
-            if ev.readiness().is_readable() {
-                if tlsclient.do_read()? {
-                    break 'polling;
-                }
+    let mut buf = [0u8; 32 * 1024];
+    let peek = out.read_many(&mut buf)?;
+    let buf = &buf[..peek];
 
-                let mut plaintext = Vec::new();
-                let rc = tlsclient.tls_session.read_to_end(&mut plaintext);
-                if !plaintext.is_empty() {
-                    io::stdout().write_all(&plaintext).unwrap();
-                }
+    let (status_line, buf) = match memchr::memchr(b'\n', buf) {
+        Some(end) => buf.split_at(end),
+        None => bail!("status line too long"),
+    };
 
-                // If that fails, the peer might have started a clean TLS-level session closure.
-                if let Err(err) = rc {
-                    if io::ErrorKind::ConnectionAborted == err.kind() {
-                        break 'polling;
-                    }
+    let status_line = String::from_utf8(status_line.to_vec())?;
+    let mut status_line = status_line.split_whitespace();
 
-                    Err(err)?;
-                }
-            }
+    let _http_version = status_line
+        .next()
+        .ok_or_else(|| err_msg("invalid status line: no http version"))?;
+    let response_code = status_line
+        .next()
+        .ok_or_else(|| err_msg("invalid status line: no response code"))?
+        .parse()?;
 
-            if ev.readiness().is_writable() {
-                tlsclient.do_write();
-            }
+    let mut headers = [httparse::EMPTY_HEADER; 64];
 
-            tlsclient.reregister(&mut poll);
-        }
+    let (header_end, headers) = match httparse::parse_headers(buf, &mut headers)? {
+        httparse::Status::Complete(r) => r,
+        httparse::Status::Partial => bail!("headers are too long (or horribly invalid)"),
+    };
+
+    assert!(header_end < buf.len());
+    let header_end = header_end as u64;
+
+    out.seek(SeekFrom::Start(header_end))?;
+
+    Ok(Response {
+        response_code,
+        header_end,
+        inner: io::BufReader::new(out),
+    })
+}
+
+impl Response {
+    pub fn rewind(&mut self) -> io::Result<()> {
+        self.inner.seek(SeekFrom::Start(self.header_end))?;
+        Ok(())
     }
 
-    drop(poll);
-
-    Ok(())
-}
-
-pub struct WriteVAdapter<'a> {
-    rawv: &'a mut dyn Rawv,
-}
-
-impl<'a> WriteVAdapter<'a> {
-    pub fn new(rawv: &'a mut dyn Rawv) -> WriteVAdapter<'a> {
-        WriteVAdapter { rawv }
+    pub fn status(&self) -> StatusCode {
+        StatusCode(self.response_code)
     }
 }
 
-impl<'a> rustls::WriteV for WriteVAdapter<'a> {
-    fn writev(&mut self, bytes: &[&[u8]]) -> io::Result<usize> {
-        self.rawv.writev(bytes)
+impl StatusCode {
+    pub fn is_success(&self) -> bool {
+        self.0 >= 200 && self.0 <= 299
     }
 }
